@@ -1,13 +1,22 @@
-## 📚 Используемые библиотеки
+import tempfile
+from django.conf import settings
+from django.core.files.base import ContentFile, File
+from django.core.files.storage import FileSystemStorage
+from cryptography.fernet import Fernet
 
-| Библиотека                      | Тип             | Назначение                                                                 |
-|----------------------------------|------------------|-----------------------------------------------------------------------------|
-| **Django**                      | Сторонняя        | Веб-фреймворк                                                              |
-| **djangorestframework**         | Сторонняя        | Построение REST API                                                        |
-| **psycopg2 / psycopg2-binary**  | Сторонняя        | Драйвер PostgreSQL                                                         |
-| **python-gssapi / requests-kerberos** | Сторонняя  | Поддержка Kerberos (GSSAPI, SPNEGO, REMOTE_USER)                          |
-| **prettylog**                   | Локальная        | Модуль логгирования с цветами, иконками и таймингом                        |
-| **db_backend**                  | Локальная        | Кастомный backend с маршрутизацией подключений к БД                       |
-| **middleware**                  | Локальная        | Пользовательские middleware                                                |
-| **utils**                       | Локальная        | Утилитарные функции                                                        |
-| **context.py**                  | Локальная        | Общие переменные и shared-контекст                                         |
+class EncryptedFileSystemStorage(FileSystemStorage):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fernet = Fernet(settings.FILE_ENCRYPTION_KEY)
+
+    def _save(self, name, content):
+        encrypted = self.fernet.encrypt(content.read())
+        return super()._save(name, ContentFile(encrypted))
+
+    def _open(self, name, mode='rb'):
+        encrypted_file = super()._open(name, mode)
+        decrypted = self.fernet.decrypt(encrypted_file.read())
+        tmp = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
+        tmp.write(decrypted)
+        tmp.seek(0)
+        return File(tmp, name)
