@@ -1,96 +1,126 @@
-import io, time, zipfile, os
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
-from django.db.models import Q
-from rest_framework import status, viewsets
-from rest_framework.parsers import MultiPartParser
-from rest_framework.response import Response
-from django.http import FileResponse
-from django.core.files.base import ContentFile
-from django.shortcuts import get_object_or_404
+import io
+import os
+import tempfile
+
 from django.conf import settings
+from django.core.files.storage import FileSystemStorage
 
-from .models import FilePackage
-from .serializers import FilePackageSerializer
-from .storage import EncryptedFileSystemStorage
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
-class FilePackageViewSet(viewsets.ModelViewSet):
-    serializer_class = FilePackageSerializer
-    parser_classes = [MultiPartParser]
+# Получаем настройки с дефолтами
+NONCE_LEN     = getattr(settings, 'FILE_ENCRYPTION_NONCE_LEN', 12)
+TAG_LEN       = getattr(settings, 'FILE_ENCRYPTION_TAG_LEN', 16)
+ENC_BUF_MB    = getattr(settings, 'FILE_ENCRYPTION_BUFFER_LIMIT_MB', 20)
+DEC_BUF_MB    = getattr(settings, 'FILE_DECRYPTION_BUFFER_LIMIT_MB', 20)
+ENC_CHUNK     = getattr(settings, 'FILE_ENCRYPTION_CHUNK_SIZE', 8192)
+DEC_CHUNK     = getattr(settings, 'FILE_DECRYPTION_CHUNK_SIZE', 8192)
 
-    def get_queryset(self):
-        now = timezone.now()
-        return FilePackage.objects.filter(
-            is_deleted=False
-        ).filter(
-            Q(expires_at__isnull=True) | Q(expires_at__gt=now)
+
+class EncryptingStreamWriter:
+    def __init__(self, input_stream, key, buffer_limit_mb=20, chunk_size=8192, nonce_len=12):
+        self.input_stream = input_stream
+        self.key = key
+        self.chunk_size = chunk_size
+        self.nonce_len = nonce_len
+
+        self.nonce = os.urandom(self.nonce_len)
+        self.encryptor = Cipher(
+            algorithms.AES(self.key),
+            modes.GCM(self.nonce),
+            backend=default_backend()
+        ).encryptor()
+
+        self.buffer = tempfile.SpooledTemporaryFile(
+            max_size=buffer_limit_mb * 1024 * 1024
         )
+        self._write_encrypted()
 
-    def get_object(self):
-        return get_object_or_404(self.get_queryset(), pk=self.kwargs['pk'])
+    def _write_encrypted(self):
+        self.buffer.write(self.nonce)
 
-    def create(self, request, *args, **kwargs):
-        files = request.FILES.getlist('file')
-        if not files:
-            return Response({'error': 'No files provided'}, status=400)
+        while True:
+            chunk = self.input_stream.read(self.chunk_size)
+            if not chunk:
+                break
+            self.buffer.write(self.encryptor.update(chunk))
 
-        expires_raw = request.data.get('expires_at')
-        expires_at = parse_datetime(expires_raw) if expires_raw else None
+        self.buffer.write(self.encryptor.finalize())
+        self.buffer.write(self.encryptor.tag)
+        self.buffer.seek(0)
 
-        storage_type = request.data.get('storage_type', 'fast')
-        if storage_type not in ('fast', 'slow'):
-            return Response({'error': 'Invalid storage_type'}, status=400)
+    def get_stream(self):
+        return self.buffer
 
-        file_metadata = []
-        zip_buffer = io.BytesIO()
 
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for f in files:
-                data = f.read()
-                zf.writestr(f.name, data)
-                file_metadata.append({
-                    'filename': f.name,
-                    'size': f.size,
-                    'content_type': f.content_type or 'application/octet-stream'
-                })
-        zip_buffer.seek(0)
+class DecryptingStream(io.RawIOBase):
+    def __init__(self, fileobj, decryptor, enc_len, chunk_size=8192):
+        self._file = fileobj
+        self._decryptor = decryptor
+        self._remaining = enc_len
+        self._chunk_size = chunk_size
+        self._finalized = False
 
-        location = settings.FAST_STORAGE_ROOT if storage_type == 'fast' else settings.SLOW_STORAGE_ROOT
-        storage = EncryptedFileSystemStorage(location=location)
+    def read(self, size=-1):
+        if self._finalized:
+            return b""
 
-        archive_name = f"package_{int(time.time())}.zip.enc"
-        storage.save(archive_name, ContentFile(zip_buffer.read()))
+        if size == -1 or size is None:
+            size = self._chunk_size
 
-        obj = FilePackage.objects.create(
-            archive=os.path.join('packages', archive_name),
-            original_name=archive_name,
-            file_list=file_metadata,
-            expires_at=expires_at,
-            storage_type=storage_type
+        size = min(size, self._chunk_size)
+
+        if self._remaining <= 0:
+            self._finalized = True
+            return self._decryptor.finalize()
+
+        to_read = min(size, self._remaining)
+        chunk = self._file.read(to_read)
+        self._remaining -= len(chunk)
+
+        out = self._decryptor.update(chunk)
+
+        if self._remaining == 0:
+            out += self._decryptor.finalize()
+            self._finalized = True
+
+        return out
+
+    def readable(self): return True
+    def close(self):    self._file.close()
+    def __getattr__(self, attr): return getattr(self._file, attr)
+
+
+class EncryptedFileSystemStorage(FileSystemStorage):
+    def _save(self, name, content):
+        key = getattr(settings, 'FILE_ENCRYPTION_KEY')
+        writer = EncryptingStreamWriter(
+            input_stream=content,
+            key=key,
+            buffer_limit_mb=ENC_BUF_MB,
+            chunk_size=ENC_CHUNK,
+            nonce_len=NONCE_LEN
         )
+        return super()._save(name, writer.get_stream())
 
-        return Response(self.get_serializer(obj).data, status=201)
+    def _open(self, name, mode='rb'):
+        encrypted = super()._open(name, mode)
 
-    def destroy(self, request, *args, **kwargs):
-        obj = self.get_object()
-        provided_key = request.query_params.get('private_key')
-        if not provided_key:
-            return Response({'error': 'Missing ?private_key=...'}, status=400)
-        if str(obj.private_key) != provided_key:
-            return Response({'error': 'Invalid private key'}, status=403)
+        encrypted.seek(0, os.SEEK_END)
+        total = encrypted.tell()
+        encrypted.seek(0)
 
-        obj.is_deleted = True
-        obj.save()
-        return Response(status=204)
+        nonce = encrypted.read(NONCE_LEN)
+        enc_len = total - NONCE_LEN - TAG_LEN
+        encrypted.seek(NONCE_LEN + enc_len)
+        tag = encrypted.read(TAG_LEN)
+        encrypted.seek(NONCE_LEN)
 
-    def retrieve(self, request, *args, **kwargs):
-        obj = self.get_object()
-        provided_key = request.query_params.get('public_key')
-        if provided_key and str(obj.public_key) == provided_key:
-            location = settings.FAST_STORAGE_ROOT if obj.storage_type == 'fast' else settings.SLOW_STORAGE_ROOT
-            storage = EncryptedFileSystemStorage(location=location)
-            fh = storage.open(obj.archive.name, 'rb')
-            return FileResponse(fh, as_attachment=True,
-                                filename=obj.original_name,
-                                content_type='application/zip')
-        return super().retrieve(request, *args, **kwargs)
+        key = getattr(settings, 'FILE_ENCRYPTION_KEY')
+        decryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(nonce, tag),
+            backend=default_backend()
+        ).decryptor()
+
+        return DecryptingStream(encrypted, decryptor, enc_len, chunk_size=DEC_CHUNK)
